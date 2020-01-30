@@ -6,8 +6,9 @@ use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 use termion::{clear, color, cursor, style};
 
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -32,6 +33,9 @@ struct Opt {
     verbose: u8,
 }
 
+struct Event {
+    t: u128,
+}
 struct Tui<R, W: Write> {
     stdout: W,
     stdin: R,
@@ -41,7 +45,7 @@ struct Tui<R, W: Write> {
     height: u16,
 }
 
-fn tui_init<W: Write, R: Read>(mut stdout: W, stdin: R) {
+fn tui_init<W: Write, R: Read>(mut stdout: W, stdin: R) -> Tui<termion::input::Keys<R>, W> {
     write!(stdout, "{}", clear::All).unwrap();
     write!(stdout, "{}", cursor::Goto(1, 1)).unwrap();
     stdout.flush().unwrap();
@@ -54,41 +58,43 @@ fn tui_init<W: Write, R: Read>(mut stdout: W, stdin: R) {
         width: 64,
         height: 16,
     };
-    tui.start()
+    tui
 }
-//
+
 impl<R: Iterator<Item = Result<Key, std::io::Error>>, W: Write> Tui<R, W> {
     fn reset(&mut self) {}
 
-    fn start(&mut self) {
+    fn start(&mut self, rx: mpsc::Receiver<Event>) {
         loop {
-            let key = self.stdin.next().unwrap().unwrap();
+            for receive in rx.try_iter() {
+                write!(
+                    self.stdout,
+                    "{}{}{}",
+                    cursor::Goto(1, self.height + 1),
+                    clear::CurrentLine,
+                    receive.t
+                )
+                .unwrap();
+            }
 
-            match key {
-                Char('h') => self.x = self.left(self.x),
-                Char('j') => self.y = self.down(self.y),
-                Char('k') => self.y = self.up(self.y),
-                Char('l') => self.x = self.right(self.x),
-                Char('q') => return,
-                Char(c) => {
-                    write!(
-                        self.stdout,
-                        "{}{}{}",
-                        color::Bg(color::LightBlue),
-                        c,
-                        color::Bg(color::Reset)
-                    );
-                }
-                _ => {
-                    write!(self.stdout, "{:?}", key);
+            loop {
+                let key = self.stdin.next();
+                match key {
+                    Some(Ok(Char('q'))) => return,
+                    Some(Ok(Char('h'))) => self.x = self.left(self.x),
+                    Some(Ok(Char('j'))) => self.y = self.down(self.y),
+                    Some(Ok(Char('k'))) => self.y = self.up(self.y),
+                    Some(Ok(Char('l'))) => self.x = self.right(self.x),
+                    Some(Ok(Char(x))) => write!(self.stdout, "{}{}", cursor::Goto(self.x + 1, self.y + 1), x).unwrap(),
+                    Some(Err(_)) => {}
+                    None => break,
+                    _ => {}
                 }
             }
 
-            self.print_status();
-            // Ensure cursor position is on current position
-            let stride = 1;
-            write!(self.stdout, "{}", cursor::Goto((self.x * stride) + 1, self.y + 1)).unwrap();
+            write!(self.stdout, "{}", cursor::Goto(self.x + 1, self.y + 1)).unwrap();
             self.stdout.flush().unwrap();
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -134,8 +140,7 @@ fn main() {
     // lock stdio
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
+    let stdin = termion::async_stdin();
     let stderr = io::stderr();
     let mut stderr = stderr.lock();
 
@@ -148,16 +153,35 @@ fn main() {
     let midi_out = pm_context.default_output_port(64).unwrap();
 
     let mut stdout = stdout.into_raw_mode().unwrap();
-    //let termsize = termion::terminal_size().ok();
+    //let termsize = termion::terminal_size().ok()
 
-    let mut instance = vm::from_string(input, midi_out);
-    let h = thread::spawn(move || loop {
-        instance.tick();
-        let next = Duration::from_millis(1000 / (instance.tick_rate as u64));
-        thread::park_timeout(next);
-    });
+    let (tx, rx) = mpsc::channel();
+    let mut tui = tui_init(stdout, stdin);
 
-    tui_init(stdout, stdin);
+    {
+        let tx = mpsc::Sender::clone(&tx);
+        let mut instance = vm::from_string(input, midi_out);
+
+        let h = thread::spawn(move || {
+            let mut tick = Instant::now();
+
+            loop {
+                while Instant::now() < tick {
+                    thread::yield_now();
+                }
+                tx.send(Event {
+                    t: (Instant::now() - tick).as_micros(),
+                });
+
+                let accuracy = Duration::from_millis(1);
+                instance.tick();
+                tick += instance.tick;
+                thread::park_timeout(tick - accuracy - Instant::now());
+            }
+        });
+    }
+
+    tui.start(rx);
 
     //Ok(())
 }

@@ -9,5 +9,6 @@ edition = "2018"
 [dependencies]
 portmidi = "^0.2"
 structopt = "^0.3"
+rand = "^0.7"
 termion = "^1.5"
 toml = "^0.5"
